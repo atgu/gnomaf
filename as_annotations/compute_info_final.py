@@ -2,8 +2,16 @@ __author__ = 'Lindo Nkambule & Sophie Parsa'
 
 import argparse
 import hail as hl
+import logging
 
 from hail.expr.functions import _cdf_combine, _quantile_from_cdf, _result_from_raw_cdf
+
+logging.basicConfig(
+    format="%(asctime)s (%(name)s %(lineno)s): %(message)s",
+    datefmt="%m/%d/%Y %I:%M:%S %p",
+)
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 AS_INFO_AGG_FIELDS_VQSR = {
     "sum_agg_fields": ["AS_QUALapprox", "AS_VarDP"],
@@ -13,23 +21,34 @@ AS_INFO_AGG_FIELDS_VQSR = {
 }
 
 
-def combine_two_cohorts(ht1: hl.Table, ht2: hl.Table, cdf_k: int = 200) -> hl.Table:
+def combine_two_cohorts(ht1: hl.Table, ht2: hl.Table, cdf_k: int = 200, num_cohorts_so_far: int = 1) -> hl.Table:
     """
     Given AS annotations from two cohorts, this function combines the annotations into one
 
     :param ht1: input Table from cohort 1 with AS annotations from compute_info_intermediate
     :param ht2: input Table from cohort 2 with AS annotations from compute_info_intermediate
     :param cdf_k: Parameter controlling the accuracy vs. memory usage tradeoff when retaining CDF
+    :param num_cohorts_so_far: Number of cohorts aggregated so far. We start counting at 1
+        This is needed to properly extend AS_MQ across cohorts
     :return: hl.Table with annotations from two cohorts combined
     """
     joined_ht = ht1.join(ht2, how='outer')
 
     # for AS_MQ, we need to keep the values in array with each element representing a cohort's AS_MQ
     # when AS_MQ is missing in a cohort, fill with 0
-    joined_ht = joined_ht.annotate(AS_MQ=hl.if_else(hl.is_missing(joined_ht.AS_MQ),
-                                                    hl.array([hl.float64(0)]), joined_ht.AS_MQ),
-                                   AS_MQ_1=hl.if_else(hl.is_missing(joined_ht.AS_MQ_1),
-                                                      hl.array([hl.float64(0)]), joined_ht.AS_MQ_1))
+    # https://hail.zulipchat.com/#narrow/channel/123010-Hail-Query-0.2E2-support/topic/Aggregating.20multiple.20HTs.20and.20partitions/near/512409263
+    joined_ht = joined_ht.annotate(
+        AS_MQ=hl.if_else(
+            hl.is_missing(joined_ht.AS_MQ),
+            hl.range(0, num_cohorts_so_far).map(lambda _: hl.float64(0)),
+            joined_ht.AS_MQ
+        ),
+        AS_MQ_1=hl.if_else(
+            hl.is_missing(joined_ht.AS_MQ_1),
+            hl.array([hl.float64(0)]),
+            joined_ht.AS_MQ_1
+        )
+    )
 
     annotations = {}
     fields_to_drop = []
@@ -86,11 +105,12 @@ def main():
     args = parser.parse_args()
     cohorts = args.intermediate_annotations.split(",")
     as_hts = [hl.read_table(f'{ht_p}') for ht_p in cohorts]
+    logger.info(f"Found {len(as_hts)} cohorts to be aggregated")
 
     # hierarchically combine annotations
     combined_ht = as_hts[0]
-    for ht in as_hts[1:]:
-        combined_ht = combine_two_cohorts(ht1=combined_ht, ht2=ht, cdf_k=args.cdf_k)
+    for i, ht in enumerate(as_hts[1:], start=1):
+        combined_ht = combine_two_cohorts(combined_ht, ht, cdf_k=args.cdf_k, num_cohorts_so_far=i)
 
     # compute final (aggregated) annotations
     # 1. AS_ReadPosRankSum
@@ -151,23 +171,25 @@ def main():
     ) # to avoid -0.0 values
 
     # 6. AS_MQ
-    # if sample size are given, use weighted mean, else use median
+    # if sample sizes are given, use weighted mean, else use median
     if args.sample_sizes:
+        logger.info(f"Computing AS_MQ as W(AS_MQ), where the MQs are weighted by cohort sample size")
         sample_sizes = args.sample_sizes.split(",")
         sample_sizes = [int(i) for i in sample_sizes]
-        assert len(sample_sizes) == len(as_hts), "--sample-sizes must have the same items as --intermediate-annotations"
+        assert len(sample_sizes) == len(as_hts), "--sample-sizes must have the same number of items as --intermediate-annotations"
         weights_expr = hl.literal(sample_sizes)
 
         combined_ht = combined_ht.annotate(
             AS_MQ=hl.sum(combined_ht.AS_MQ * weights_expr) / hl.sum(weights_expr)
         )
     else:
+        logger.info(f"Computing AS_MQ as median(AS_MQ)")
         combined_ht = combined_ht.annotate(
             AS_MQ=hl.median(combined_ht.AS_MQ)
         )
 
     # drop intermediate annotations
-    fields_to_keep = {'locus', 'alleles', 'AS_MQ', 'AS_ReadPosRankSum', 'AS_MQRankSum', 'AS_QD', 'AS_SOR', 'AS_FS'}
+    fields_to_keep = {'locus', 'alleles', 'AS_FS', 'AS_ReadPosRankSum', 'AS_MQRankSum', 'AS_QD', 'AS_MQ', 'AS_SOR'}
     combined_ht = combined_ht.drop(*[k for k in combined_ht.row if k not in fields_to_keep])
 
     # nest annotations under info
@@ -178,8 +200,12 @@ def main():
     )
     combined_ht = combined_ht.drop(*[k for k in combined_ht.row if k not in {'locus', 'alleles', 'info'}])
 
-    # write HT with AS annotations
-    combined_ht.write(f'{args.out_dir}/{args.output_prefix}_as_annotations_final.ht', overwrite=True)
+    # write VCF with AS annotations
+    logger.info(f"Checkpointing aggregated annotations to {args.out_dir}/tmp/{args.output_prefix}.as_annotations.ht")
+    combined_ht = combined_ht.checkpoint(f'{args.out_dir}/tmp/{args.output_prefix}.as_annotations.ht', overwrite=True)
+
+    logger.info(f"Writing AS annotations to {args.out_dir}/{args.output_prefix}.as_annotations.vcf.bgz")
+    hl.export_vcf(combined_ht, f'{args.out_dir}/{args.output_prefix}.as_annotations.vcf.bgz', tabix=True)
 
 
 if __name__ == '__main__':
