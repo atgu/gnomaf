@@ -82,11 +82,7 @@ def filter_format_ht(ht: hl.Table) -> hl.Table:
     ht = ht.drop(*fields_to_drop)
 
     # split multi-allelics
-    bi = ht.filter(hl.len(ht.alleles) == 2)
-    bi = bi.annotate(a_index=1, was_split=False, old_locus=bi.locus, old_alleles=bi.alleles)
-    multi = ht.filter(hl.len(ht.alleles) > 2)
-    split = hl.split_multi(multi)
-    ht = split.union(bi)
+    ht = hl.split_multi(ht)
 
     # split_multi will only split the alleles, not annotations. Update the annotations
     ht = ht.annotate(a_index=hl.array([ht.a_index])) # a_index starts at 1
@@ -127,7 +123,8 @@ def main():
 
         if input_type == "vds":
             vds = hl.vds.read_vds(filepath)
-            missing_anns = check_missing_annotations(list(vds.variant_data.gvcf_info) + list(vds.variant_data.entry))
+            _fields = list(vds.variant_data.gvcf_info) + list(vds.variant_data.entry)
+            missing_anns = check_missing_annotations(_fields)
             if len(missing_anns) > 0:
                 vds = compute_missing_annotations(vds, missing_anns)
 
@@ -136,11 +133,15 @@ def main():
 
         else: # HGDP+1kGP file is a MT and has no missing annotations
             mt = hl.read_matrix_table(filepath)
+            _fields = list(mt.gvcf_info) + list(mt.entry)
 
             # data to be passed to default_compute_info should be filtered to nonref sites
             mt = mt.filter_entries(mt.LGT.is_non_ref(), keep=True)
 
-            # We have RAW_MQ and MQ_DP as separate annotations but default_compute_info looks for RAW_MQandDP
+        # If we have RAW_MQ and MQ_DP as separate annotations, combine them into RAW_MQandDP (RAW_MQ, MQ_DP) as
+        # default_compute_info looks for RAW_MQandDP
+        if ('RAW_MQandDP' not in _fields) and ('RAW_MQ' in _fields):
+            logger.info("Adding `RAW_MQandDP` as array[RAW_MQ, MQ_DP]")
             mt = mt.annotate_entries(gvcf_info=mt.gvcf_info.annotate(RAW_MQandDP=hl.array([mt.gvcf_info.RAW_MQ,
                                                                                            mt.gvcf_info.MQ_DP])))
 
